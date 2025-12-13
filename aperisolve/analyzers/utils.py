@@ -1,6 +1,6 @@
 """Utility functions for analyzers modules."""
 
-#import fcntl
+import fcntl
 import json
 import os
 import threading
@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 import itertools
 import zlib
-import ijson
 import sqlite3
 
 _thread_lock = threading.Lock()
