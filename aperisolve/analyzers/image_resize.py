@@ -2,6 +2,7 @@
 
 import zlib
 import shutil
+import sqlite3
 from pathlib import Path
 from .utils import update_data
 
@@ -90,39 +91,93 @@ EXPECTED_SIZES = [
 
 ]
 
+
+def write_recovered_png(
+        png_bytes: bytes,
+        ihdr_offset: int,
+        width: int,
+        height: int,
+        output_path: Path,
+) -> str:
+    """
+    Rebuilds a PNG by patching IHDR width/height and writes it to disk.
+    Returns the output filename.
+    """
+    height_bytes = height.to_bytes(4, byteorder="big")
+    width_bytes = width.to_bytes(4, byteorder="big")
+    output_filename = f"recovered_{width}x{height}.png"
+
+    # Splicing: [Start...IHDR+4] + [W] + [H] + [IHDR+12...End]
+    full_png_data = (
+            png_bytes[:ihdr_offset + 4]
+            + width_bytes
+            + height_bytes
+            + png_bytes[ihdr_offset + 12:]
+    )
+
+    with output_path.open("wb") as out_f:
+        out_f.write(full_png_data)
+
+    return output_filename
+
+
 def calc_checksum(header_chunk, width_bytes, height_bytes):
     """
     Calculates the CRC32 of the IHDR chunk with new dimensions.
-    header_chunk: The full IHDR chunk (Type + Data).
     """
-    # Reconstruct IHDR: [Type(4)] + [New Width(4)] + [New Height(4)] + [Rest of Data(5)]
     new_header = header_chunk[:4] + width_bytes + height_bytes + header_chunk[12:]
-
-    # Calculate CRC and return as 4 bytes (Big Endian)
     return bytearray((zlib.crc32(new_header) & 0xffffffff).to_bytes(4, byteorder='big'))
+
+
+def lookup_crc(crc_bytes: bytes, logs: list) -> list:
+    """
+    Queries the SQLite DB for the CRC and returns a list of (width, height) tuples.
+    """
+    # Locate DB relative to this script file
+    db_path = Path(__file__).parent / "ihdr_crcs.db"
+
+    if not db_path.exists():
+        logs.append(f"Error: Database not found at {db_path}")
+        return []
+
+    try:
+        target_crc = int.from_bytes(crc_bytes, byteorder="big")
+    except ValueError:
+        logs.append(f"Invalid CRC bytes: {crc_bytes}")
+        return []
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # Query the database
+    cursor.execute("SELECT width, height FROM ihdr WHERE crc = ?", (target_crc,))
+    results = cursor.fetchall()  # Returns list of (width, height)
+    conn.close()
+
+    if results:
+        logs.append(f"Database: Found {len(results)} match(es) for CRC {target_crc}")
+        return results
+    else:
+        logs.append(f"Database: No match found for CRC {target_crc}")
+        return []
+
 
 def analyze_image_resize(input_img: Path, output_dir: Path) -> None:
     """
     Analyze an image submission using python-based resize bruteforce.
-    Attempts to recover PNGs with modified resolutions but valid CRCs.
+    Strategy: Check common sizes first (fast), then fall back to DB lookup (complete).
     """
-
-    # 1. Setup Paths
     input_img = Path(input_img)
     output_dir = Path(output_dir)
     extracted_dir = output_dir / "image_resize_output_dir"
-
-    # 2. CREATE THE DIRECTORY (Crucial Step!)
     extracted_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Initialize Logs
     logs = []
-    recovered_image = None
+    recovered_image = []  # FIXED: Initialize as list, not None
 
     try:
         with open(input_img, "rb") as image:
             f = image.read()
-
         b = bytearray(f)
 
         # Find IHDR start
@@ -130,64 +185,65 @@ def analyze_image_resize(input_img: Path, output_dir: Path) -> None:
         if IHDR == -1:
             logs.append("Failure: PNG header (IHDR) not found.")
             update_data(output_dir, {"image_resize": {"status": "error", "error": "PNG header not found."}})
-            if extracted_dir.exists():
-                shutil.rmtree(extracted_dir, ignore_errors=True)
             return
 
-        # Calculate Chunk Length (The 4 bytes BEFORE IHDR tag)
-        chunk_length = int.from_bytes((b[IHDR- 4: IHDR]), byteorder="big") + 4
+        # Calculate Chunk Length
+        chunk_length = int.from_bytes((b[IHDR - 4: IHDR]), byteorder="big") + 4
 
-        # Extract Target CRC (The 4 bytes AFTER the chunk data)
-        target_crc = b[IHDR + chunk_length:IHDR + chunk_length + 4]
+        # Extract Target CRC
+        target_crc_bytes = b[IHDR + chunk_length: IHDR + chunk_length + 4]
 
         # Isolate the header chunk (Type + Data)
-        header_chunk = b[IHDR:IHDR + chunk_length]
+        header_chunk = b[IHDR: IHDR + chunk_length]
 
-        logs.append(f"Target CRC found: 0x{target_crc.hex()}")
+        logs.append(f"Target CRC found: 0x{target_crc_bytes.hex()}")
 
         match_found = False
+        candidates = []
 
-        # Brute-force Loop
+        # --- STRATEGY 1: Check Common Sizes ---
         for size in EXPECTED_SIZES:
             width, height = size
+            w_bytes = bytearray(width.to_bytes(4, byteorder='big'))
+            h_bytes = bytearray(height.to_bytes(4, byteorder='big'))
 
-            # Convert dimensions to 4-byte Big Endian arrays
-            width_bytes = bytearray(width.to_bytes(4, byteorder='big'))
-            height_bytes = bytearray(height.to_bytes(4, byteorder='big'))
-
-            # Check if this size matches the file's CRC
-            if target_crc == calc_checksum(header_chunk, width_bytes, height_bytes):
+            if target_crc_bytes == calc_checksum(header_chunk, w_bytes, h_bytes):
+                logs.append(f"Success (Common List): Match found! Dimensions: {width}x{height}")
+                candidates.append((width, height))
                 match_found = True
-                logs.append(f"Success: Match found! Dimensions: {width}x{height}")
+                break
 
-                # Create Output Filename
-                output_filename = f"recovered_{width}x{height}.png"
-                output_path = extracted_dir / output_filename
-
-                # Splicing: [Start...IHDR+4] + [W] + [H] + [IHDR+12...End]
-                full_png_data = b[:IHDR+4] + width_bytes + height_bytes + b[IHDR+12:]
-
-                # Write the recovered file to disk
-                with output_path.open("wb") as out_f:
-                    out_f.write(full_png_data)
-
-                recovered_image = output_filename
-                break # Stop looking after finding the match
-
+        # --- STRATEGY 2: Check SQLite DB ---
         if not match_found:
-            logs.append("Failure: No matching dimensions found.")
+            logs.append("No common size matched. Checking database...")
+            db_matches = lookup_crc(target_crc_bytes, logs)
+            if db_matches:
+                candidates.extend(db_matches)
+                match_found = True
 
-        # 4. Final Data Update
+        # --- Generate Output Images ---
+        if match_found:
+            for w, h in candidates:
+                output_path = extracted_dir / f"recovered_{w}x{h}.png"
+                filename = write_recovered_png(b, IHDR, w, h, output_path)
+                recovered_image.append(filename)
+        else:
+            logs.append("Failure: No matching dimensions found in List or DB.")
+
+        # Final Update
         output_data = {
-            "image_resize": {  # Key name must match your module name in AperiSolve
+            "image_resize": {
                 "status": "ok",
                 "output": logs,
-                "images": recovered_image, # Tells frontend to display the image
+                "images": recovered_image,
             }
         }
         update_data(output_dir, output_data)
 
     except Exception as e:
+        # Catch-all for safety
+        import traceback
+        traceback.print_exc()
         update_data(output_dir, {"image_resize": {"status": "error", "error": str(e)}})
         if extracted_dir.exists():
             shutil.rmtree(extracted_dir, ignore_errors=True)
